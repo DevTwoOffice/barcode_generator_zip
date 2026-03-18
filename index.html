@@ -1,0 +1,319 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Excel / CSV → Barcodes (ZIP)</title>
+  <script src="https://cdn.sheetjs.com/xlsx-0.20.2/package/dist/xlsx.full.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/jsbarcode@3.11.6/dist/JsBarcode.all.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js"></script>
+  <style>
+    :root {
+      --bg: #0f1419;
+      --card: #1a2332;
+      --accent: #3d8bfd;
+      --text: #e6edf3;
+      --muted: #8b949e;
+    }
+    * { box-sizing: border-box; }
+    body {
+      font-family: "Segoe UI", system-ui, sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      max-width: 640px;
+      margin: 2rem auto;
+      padding: 0 1rem;
+      line-height: 1.5;
+    }
+    h1 { font-size: 1.35rem; font-weight: 600; margin-bottom: 0.5rem; }
+    p.muted { color: var(--muted); font-size: 0.9rem; margin-top: 0; }
+    .card {
+      background: var(--card);
+      border-radius: 12px;
+      padding: 1.5rem;
+      margin-top: 1.25rem;
+      border: 1px solid #30363d;
+    }
+    label.file-btn {
+      display: inline-block;
+      padding: 0.65rem 1.25rem;
+      background: var(--accent);
+      color: #fff;
+      border-radius: 8px;
+      cursor: pointer;
+      font-weight: 500;
+      border: none;
+    }
+    label.file-btn:hover { filter: brightness(1.08); }
+    input[type="file"] { display: none; }
+    #log {
+      margin-top: 1rem;
+      font-size: 0.85rem;
+      color: var(--muted);
+      white-space: pre-wrap;
+      max-height: 200px;
+      overflow-y: auto;
+    }
+    #log.ok { color: #3fb950; }
+    #log.err { color: #f85149; }
+    button#download {
+      margin-top: 1rem;
+      padding: 0.65rem 1.25rem;
+      background: #238636;
+      color: #fff;
+      border: none;
+      border-radius: 8px;
+      cursor: pointer;
+      font-weight: 500;
+      display: none;
+    }
+    button#download:hover { filter: brightness(1.08); }
+    ul { color: var(--muted); font-size: 0.88rem; padding-left: 1.2rem; }
+  </style>
+</head>
+<body>
+  <h1>Excel / CSV → Code128 barcodes (ZIP)</h1>
+  <p class="muted">Upload <strong>.xlsx</strong>, <strong>.xls</strong>, or <strong>.csv</strong> with columns: <strong>S No</strong>, <strong>SKU Code</strong>, <strong>Code</strong>. <code>Code</code> can look like <code>SN: 2603-CVMJ3-512850</code>.</p>
+
+  <div class="card">
+    <label class="file-btn" for="datafile">Choose Excel or CSV</label>
+    <input type="file" id="datafile" accept=".xlsx,.xls,.csv,text/csv,application/vnd.ms-excel" />
+    <div id="log"></div>
+    <button type="button" id="download">Download ZIP</button>
+  </div>
+
+  <div class="card">
+    <strong>Notes</strong>
+    <ul>
+      <li>Barcodes are Code128, saved as PNG (472×177 px, same as your Python script).</li>
+      <li>Each file is named from the barcode value (e.g. <code>2603-CVMJ3-512850.png</code>).</li>
+      <li>CSV must use comma-separated fields; quoted values (e.g. with commas inside) are supported. UTF-8 BOM is OK.</li>
+      <li>Everything runs in your browser; the file is not uploaded to any server.</li>
+    </ul>
+  </div>
+
+  <canvas id="work" width="900" height="320" style="display:none"></canvas>
+  <canvas id="out" width="472" height="177" style="display:none"></canvas>
+
+  <script>
+    const TARGET_W = 472;
+    const TARGET_H = 177;
+
+    function log(msg, cls) {
+      const el = document.getElementById("log");
+      el.className = cls || "";
+      el.textContent = msg;
+    }
+
+    function parseBarcodeText(cell) {
+      if (cell == null || String(cell).trim() === "") return null;
+      let s = String(cell).trim();
+      if (/^SN:\s*/i.test(s)) s = s.replace(/^SN:\s*/i, "").trim();
+      return s || null;
+    }
+
+    function sanitizeFilename(name) {
+      return String(name).replace(/[<>:"/\\|?*\x00-\x1f]/g, "_").slice(0, 200);
+    }
+
+    function normalizeHeader(h) {
+      return String(h == null ? "" : h).trim().toLowerCase().replace(/\s+/g, " ");
+    }
+
+    function findColIndex(headers, candidates) {
+      const norm = headers.map(normalizeHeader);
+      for (const c of candidates) {
+        const want = normalizeHeader(c);
+        const i = norm.indexOf(want);
+        if (i !== -1) return i;
+      }
+      for (let i = 0; i < norm.length; i++) {
+        for (const c of candidates) {
+          if (norm[i].includes(normalizeHeader(c).replace(/\s/g, "")) || norm[i] === normalizeHeader(c))
+            return i;
+        }
+      }
+      return -1;
+    }
+
+    /** Parse CSV (RFC-style: commas, quoted fields, doubled quotes). */
+    function parseCSV(text) {
+      text = String(text).replace(/^\uFEFF/, "");
+      const rows = [];
+      let row = [];
+      let field = "";
+      let inQuotes = false;
+
+      function endRow() {
+        row.push(field);
+        if (row.some((cell) => String(cell).trim() !== "")) rows.push(row);
+        row = [];
+        field = "";
+      }
+
+      for (let i = 0; i < text.length; i++) {
+        const c = text[i];
+        if (inQuotes) {
+          if (c === '"') {
+            if (text[i + 1] === '"') {
+              field += '"';
+              i++;
+            } else {
+              inQuotes = false;
+            }
+          } else {
+            field += c;
+          }
+          continue;
+        }
+        if (c === '"') {
+          inQuotes = true;
+          continue;
+        }
+        if (c === ",") {
+          row.push(field);
+          field = "";
+          continue;
+        }
+        if (c === "\n" || c === "\r") {
+          endRow();
+          if (c === "\r" && text[i + 1] === "\n") i++;
+          continue;
+        }
+        field += c;
+      }
+      endRow();
+      return rows;
+    }
+
+    async function loadTableRows(file) {
+      const lower = file.name.toLowerCase();
+      if (lower.endsWith(".csv")) {
+        const text = await file.text();
+        return parseCSV(text);
+      }
+      const data = await file.arrayBuffer();
+      const wb = XLSX.read(data, { type: "array" });
+      const sheetName = wb.SheetNames[0];
+      const sheet = wb.Sheets[sheetName];
+      return XLSX.utils.sheet_to_json(sheet, { header: 1, defval: "" });
+    }
+
+    function renderBarcodePng(barcodeValue) {
+      const work = document.getElementById("work");
+      const out = document.getElementById("out");
+      const wctx = work.getContext("2d");
+      const octx = out.getContext("2d");
+      wctx.fillStyle = "#fff";
+      wctx.fillRect(0, 0, work.width, work.height);
+      try {
+        JsBarcode(work, barcodeValue, {
+          format: "CODE128",
+          width: 2,
+          height: 90,
+          displayValue: true,
+          fontSize: 16,
+          margin: 16,
+          background: "#ffffff",
+          lineColor: "#000000",
+        });
+      } catch (e) {
+        throw new Error("Invalid barcode data: " + barcodeValue);
+      }
+      octx.fillStyle = "#fff";
+      octx.fillRect(0, 0, TARGET_W, TARGET_H);
+      octx.imageSmoothingEnabled = true;
+      octx.imageSmoothingQuality = "high";
+      octx.drawImage(work, 0, 0, work.width, work.height, 0, 0, TARGET_W, TARGET_H);
+      return new Promise((resolve, reject) => {
+        out.toBlob(
+          (blob) => (blob ? resolve(blob) : reject(new Error("PNG failed"))),
+          "image/png"
+        );
+      });
+    }
+
+    let lastZipBlob = null;
+    let lastBaseName = "barcodes";
+
+    document.getElementById("datafile").addEventListener("change", async (e) => {
+      const file = e.target.files && e.target.files[0];
+      document.getElementById("download").style.display = "none";
+      lastZipBlob = null;
+      if (!file) return;
+
+      log("Reading " + file.name + "…");
+      lastBaseName =
+        sanitizeFilename(file.name.replace(/\.(xlsx|xls|csv)$/i, "")) || "barcodes";
+
+      try {
+        const rows = await loadTableRows(file);
+        if (!rows.length) {
+          log("Sheet is empty.", "err");
+          return;
+        }
+
+        const headerRow = rows[0].map((c) => String(c).trim());
+        const idxCode = findColIndex(headerRow, ["Code", "code"]);
+        const idxSno = findColIndex(headerRow, ["S No", "S.No", "SNo", "Serial No"]);
+        const idxSku = findColIndex(headerRow, ["SKU Code", "SKU", "Sku Code"]);
+
+        if (idxCode === -1) {
+          log('Could not find a "Code" column. Headers found:\n' + headerRow.join(" | "), "err");
+          return;
+        }
+
+        const zip = new JSZip();
+        const folder = zip.folder("barcodes");
+        let count = 0;
+        let skipped = 0;
+        const usedNames = new Set();
+
+        for (let r = 1; r < rows.length; r++) {
+          const row = rows[r];
+          if (!row || !row.length) continue;
+          const rawCode = row[idxCode];
+          const barcodeText = parseBarcodeText(rawCode);
+          if (!barcodeText) {
+            skipped++;
+            continue;
+          }
+          let fname = sanitizeFilename(barcodeText) + ".png";
+          if (usedNames.has(fname)) {
+            const sno = idxSno >= 0 ? row[idxSno] : r;
+            fname = sanitizeFilename(String(sno) + "_" + barcodeText) + ".png";
+          }
+          usedNames.add(fname);
+
+          const blob = await renderBarcodePng(barcodeText);
+          folder.file(fname, blob);
+          count++;
+          if (count % 50 === 0) log("Generated " + count + " barcodes…");
+        }
+
+        if (count === 0) {
+          log("No valid rows (empty Code or unparsable).", "err");
+          return;
+        }
+
+        lastZipBlob = await zip.generateAsync({ type: "blob", compression: "DEFLATE" });
+        let msg = "Done: " + count + " PNG(s) in ZIP.";
+        if (skipped) msg += " Skipped " + skipped + " empty row(s).";
+        log(msg + "\nClick Download ZIP.", "ok");
+        document.getElementById("download").style.display = "inline-block";
+      } catch (err) {
+        log(String(err.message || err), "err");
+      }
+    });
+
+    document.getElementById("download").addEventListener("click", () => {
+      if (!lastZipBlob) return;
+      const a = document.createElement("a");
+      a.href = URL.createObjectURL(lastZipBlob);
+      a.download = lastBaseName + "_barcodes.zip";
+      a.click();
+      URL.revokeObjectURL(a.href);
+    });
+  </script>
+</body>
+</html>
